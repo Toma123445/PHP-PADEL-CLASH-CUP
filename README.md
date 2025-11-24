@@ -65,39 +65,22 @@ Aplicatia gestioneaza inscrierile online, scorurile, handicapurile si clasamente
 
 ### Structura proiectului
 
-/php-padel/
-
-│
-
-├── index.php # Pagina principala
-
-├── inscriere.php # Formular de inscriere echipa
-
-├── echipe.php # Lista echipelor
-
-├── meciuri.php # Lista meciurilor
-
-├── clasament.php # Clasamentul actual
-
-│
-
+```
+php-padel/
+├── index.php            # Dashboard principal
+├── login.php            # Autentificare
+├── register.php         # Creare cont jucator
+├── profil.php           # Editare date personale
+├── echipe.php           # CRUD echipe (admin)
+├── jucatori.php         # CRUD jucatori (admin)
 ├── includes/
-
-│ ├── db_connect.php # Conexiunea la baza de date
-
-│ ├── functions.php # Functii logice
-
-│
-
-├── css/
-
-│ └── style.css
-
-│
-
+│   ├── config.php       # Credentiale baza de date
+│   ├── db_connect.php   # Conexiunea PDO
+│   ├── functions.php    # Helper-e generale + sesiune
+│   └── layout.php       # Navbar si actiuni comune
 └── sql/
-
-└── schema.sql # Structura bazei de date
+    └── schema.sql       # Schema + seed-uri (divizii, admin)
+```
 
 
 ---
@@ -106,8 +89,9 @@ Aplicatia gestioneaza inscrierile online, scorurile, handicapurile si clasamente
 
 | Tabel | Scop | Campuri principale |
 |-------|------|--------------------|
+| utilizatori | Conturi si roluri | id_utilizator, email, parola_hash, rol |
 | divizii | Nivelul jucatorilor | id_divizie, nume_divizie, valoare_banda |
-| jucatori | Date despre jucatori | id_jucator, nume, prenume, id_echipa, id_divizie |
+| jucatori | Date despre jucatori | id_jucator, nume, prenume, id_echipa, id_divizie, user_id |
 | echipe | Informatii despre echipe | id_echipa, nume_echipa, capitan, divizie_principala |
 | competitii | Turnee inregistrate | id_competitie, nume, sezon |
 | grupe | Fazele grupelor | id_grupa, id_competitie, nume |
@@ -166,7 +150,16 @@ Aplicatia gestioneaza inscrierile online, scorurile, handicapurile si clasamente
 
 ---
 
-## 9. Concluzie
+## 9. Setup rapid CRUD
+
+1. Configureaza conexiunea in `includes/config.php` cu datele din hosting.
+2. Importeaza `sql/schema.sql` (creeaza toate tabelele + divizii + admin implicit).
+3. Login admin implicit: `admin@padel.local` / parola `password`. Schimba parola din `profil.php`.
+4. Pentru conturile de jucator foloseste `register.php`. Jucatorii isi pot actualiza profilul din `profil.php`, iar adminul gestioneaza echipele si jucatorii din `echipe.php` / `jucatori.php`.
+
+---
+
+## 10. Concluzie
 
 Smash Cup 5x5 este o aplicatie PHP pentru administrarea unui turneu de padel, care automatizeaza procesul de inscriere, gestionarea meciurilor si calculul clasamentului.  
 Aplicatia este scalabila si poate fi adaptata cu usurinta pentru alte sporturi precum tenis, minifotbal sau baschet 3x3.
