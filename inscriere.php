@@ -2,134 +2,101 @@
 
 declare(strict_types=1);
 
-require_once __DIR__ . '/includes/config.php';
+require_once __DIR__ . '/includes/functions.php';
 require_once __DIR__ . '/includes/db_connect.php';
-require_once __DIR__ . '/includes/layout.php';
+require_once __DIR__ . '/includes/email.php';
+require_once __DIR__ . '/config.php';
 
-require_login();
+define('APP_URL', APP_URL);
 
-$pdo = get_pdo();
-$user = current_user();
-
-// Verifică dacă utilizatorul are deja o echipă
-$stmt = $pdo->prepare('
-    SELECT e.* FROM echipe e
-    INNER JOIN jucatori j ON j.id_echipa = e.id_echipa
-    WHERE j.user_id = :user_id
-    LIMIT 1
-');
-$stmt->execute([':user_id' => $user['id']]);
-$existingTeam = $stmt->fetch();
-
-if ($existingTeam) {
-    flash('info', 'Ai deja o echipă înregistrată: ' . escape_html($existingTeam['nume_echipa']));
-    redirect('index.php');
-}
-
-$divisions = $pdo->query('SELECT id_divizie, nume_divizie FROM divizii ORDER BY valoare_banda')->fetchAll();
-
-// Obține jucători disponibili (fără echipă sau utilizatorul curent)
-$availablePlayers = $pdo->query('
-    SELECT id_jucator, nume, prenume, id_divizie 
-    FROM jucatori 
-    WHERE id_echipa IS NULL 
-    ORDER BY nume, prenume
-')->fetchAll();
+$pdo = get_db();
+$errors = [];
+$success = false;
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if (!verify_csrf($_POST['csrf_token'] ?? null)) {
-        flash('danger', 'Token CSRF invalid.');
-        redirect('inscriere.php');
-    }
-
-    // Verificare rate limiting
-    if (!check_rate_limit('team_registration_' . $user['id'], 3, 3600)) {
-        flash('danger', 'Prea multe încercări. Te rugăm să aștepți o oră.');
-        redirect('inscriere.php');
-    }
-
-    // Verificare reCAPTCHA pentru formularele publice
-    if (!verify_recaptcha($_POST['g-recaptcha-response'] ?? null)) {
-        flash('danger', 'Verificarea reCAPTCHA a eșuat. Te rugăm să încerci din nou.');
-        redirect('inscriere.php');
-    }
-
-    $payload = sanitize($_POST);
-    
-    $errors = validate_required($payload, [
-        'nume_echipa' => 'Nume echipa',
-        'divizie_id' => 'Divizie',
-        'jucatori' => 'Jucatori'
-    ]);
-
-    // Validare nume echipă
-    if (isset($payload['nume_echipa']) && strlen($payload['nume_echipa']) < 3) {
-        $errors['nume_echipa'] = 'Numele echipei trebuie să aibă minim 3 caractere.';
-    }
-
-    // Validare jucători (trebuie exact 5)
-    $selectedPlayers = $payload['jucatori'] ?? [];
-    if (!is_array($selectedPlayers) || count($selectedPlayers) !== 5) {
-        $errors['jucatori'] = 'Trebuie să selectezi exact 5 jucători.';
-    }
-
-    if ($errors) {
-        flash('danger', implode('<br>', $errors));
-        redirect('inscriere.php');
-    }
-
-    // Verifică dacă jucătorii sunt disponibili
-    $placeholders = implode(',', array_fill(0, count($selectedPlayers), '?'));
-    $stmt = $pdo->prepare("
-        SELECT id_jucator FROM jucatori 
-        WHERE id_jucator IN ($placeholders) AND id_echipa IS NULL
-    ");
-    $stmt->execute($selectedPlayers);
-    
-    if ($stmt->rowCount() !== 5) {
-        flash('danger', 'Unul sau mai mulți jucători selectați nu sunt disponibili.');
-        redirect('inscriere.php');
-    }
-
-    $pdo->beginTransaction();
-    
-    try {
-        // Creează echipa
-        $stmt = $pdo->prepare('
-            INSERT INTO echipe (nume_echipa, capitan, email_capitan, telefon_capitan, divizie_id, data_inscriere)
-            VALUES (:nume, :capitan, :email, :telefon, :divizie, NOW())
-        ');
+        $errors['general'] = 'Token CSRF invalid. Te rugam sa reincarci pagina.';
+    } else {
+        $data = sanitize($_POST);
         
-        $stmt->execute([
-            ':nume' => $payload['nume_echipa'],
-            ':capitan' => $user['nume'] . ' ' . $user['prenume'],
-            ':email' => $user['email'],
-            ':telefon' => $payload['telefon_capitan'] ?? null,
-            ':divizie' => (int)$payload['divizie_id']
-        ]);
+        $required = [
+            'nume_echipa' => 'Nume echipă',
+            'capitan' => 'Nume capitan',
+            'email' => 'Email',
+            'telefon' => 'Telefon'
+        ];
         
-        $teamId = (int)$pdo->lastInsertId();
+        $errors = validate_required($data, $required);
         
-        // Asociază jucătorii cu echipa
-        $stmt = $pdo->prepare('UPDATE jucatori SET id_echipa = :team_id WHERE id_jucator = :player_id');
-        foreach ($selectedPlayers as $playerId) {
-            $stmt->execute([
-                ':team_id' => $teamId,
-                ':player_id' => (int)$playerId
-            ]);
+        if (empty($errors)) {
+            try {
+                // Check if team name already exists
+                $stmt = $pdo->prepare("SELECT id_echipa FROM echipe WHERE nume_echipa = ?");
+                $stmt->execute([$data['nume_echipa']]);
+                if ($stmt->fetch()) {
+                    $errors['nume_echipa'] = 'Această echipă există deja.';
+                } else {
+                    // Get current competition
+                    $stmt = $pdo->query("SELECT id_competitie FROM competitii ORDER BY id_competitie DESC LIMIT 1");
+                    $competitie = $stmt->fetch();
+                    $id_competitie = $competitie['id_competitie'] ?? null;
+                    
+                    // Insert team
+                    $stmt = $pdo->prepare("
+                        INSERT INTO echipe (nume_echipa, capitan, email_capitan, telefon, id_competitie, status)
+                        VALUES (?, ?, ?, ?, ?, 'pending')
+                    ");
+                    $stmt->execute([
+                        $data['nume_echipa'],
+                        $data['capitan'],
+                        $data['email'],
+                        $data['telefon'],
+                        $id_competitie
+                    ]);
+                    
+                    $id_echipa = $pdo->lastInsertId();
+                    
+                    // Add players
+                    for ($i = 1; $i <= 5; $i++) {
+                        if (!empty($data["jucator_nume_$i"]) && !empty($data["jucator_prenume_$i"])) {
+                            $id_divizie = $data["jucator_divizie_$i"] ?? 1;
+                            $stmt = $pdo->prepare("
+                                INSERT INTO jucatori (nume, prenume, id_echipa, id_divizie)
+                                VALUES (?, ?, ?, ?)
+                            ");
+                            $stmt->execute([
+                                $data["jucator_nume_$i"],
+                                $data["jucator_prenume_$i"],
+                                $id_echipa,
+                                $id_divizie
+                            ]);
+                        }
+                    }
+                    
+                    // Send confirmation email
+                    send_registration_email($data['email'], $data['nume_echipa']);
+                    
+                    flash('success', 'Înscrierea a fost trimisă cu succes! Vei primi un email de confirmare.');
+                    redirect('inscriere.php');
+                }
+            } catch (PDOException $e) {
+                error_log($e->getMessage());
+                $errors['general'] = 'A apărut o eroare. Te rugăm să încerci din nou.';
+            }
         }
-        
-        $pdo->commit();
-        
-        flash('success', 'Echipa a fost înregistrată cu succes! Așteaptă validarea administratorului.');
-        redirect('index.php');
-        
-    } catch (Throwable $e) {
-        $pdo->rollBack();
-        flash('danger', 'A apărut o eroare la înregistrare. Te rugăm să încerci din nou.');
-        redirect('inscriere.php');
     }
 }
+
+// Get divisions
+$divizii = [];
+try {
+    $stmt = $pdo->query("SELECT * FROM divizii ORDER BY valoare_banda");
+    $divizii = $stmt->fetchAll();
+} catch (PDOException $e) {
+    error_log($e->getMessage());
+}
+
+$flashes = get_flashes();
 
 ?>
 <!DOCTYPE html>
@@ -137,102 +104,131 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Înscriere echipă - Smash Cup 5x5</title>
+    <title>Înscriere Echipă - <?= htmlspecialchars(APP_NAME) ?></title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-    <script src="https://www.google.com/recaptcha/api.js" async defer></script>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css" rel="stylesheet">
+    <link href="css/style.css" rel="stylesheet">
 </head>
-<body class="bg-light">
-<?php render_nav('inscriere'); ?>
+<body>
+    <?php include 'includes/header.php'; ?>
 
-<div class="container py-5">
-    <div class="row justify-content-center">
-        <div class="col-lg-8">
-            <div class="card shadow-sm">
-                <div class="card-body">
-                    <h1 class="h4 mb-3">Înscriere echipă</h1>
-                    <?php display_flashes(); ?>
-                    
-                    <form method="POST" action="inscriere.php" id="teamRegistrationForm">
-                        <input type="hidden" name="csrf_token" value="<?= csrf_token() ?>">
-                        
-                        <div class="mb-3">
-                            <label for="nume_echipa" class="form-label">Nume echipă *</label>
-                            <input type="text" class="form-control" id="nume_echipa" name="nume_echipa" 
-                                   required minlength="3" maxlength="150" 
-                                   value="<?= escape_html($_POST['nume_echipa'] ?? '') ?>">
-                            <small class="text-muted">Minim 3 caractere</small>
-                        </div>
-                        
-                        <div class="mb-3">
-                            <label for="divizie_id" class="form-label">Divizie *</label>
-                            <select class="form-select" id="divizie_id" name="divizie_id" required>
-                                <option value="">Selectează divizia</option>
-                                <?php foreach ($divisions as $division): ?>
-                                    <option value="<?= (int)$division['id_divizie'] ?>">
-                                        <?= escape_html($division['nume_divizie']) ?>
-                                    </option>
-                                <?php endforeach; ?>
-                            </select>
-                        </div>
-                        
-                        <div class="mb-3">
-                            <label for="telefon_capitan" class="form-label">Telefon capitan</label>
-                            <input type="text" class="form-control" id="telefon_capitan" name="telefon_capitan" 
-                                   maxlength="30" value="<?= escape_html($_POST['telefon_capitan'] ?? '') ?>">
-                        </div>
-                        
-                        <div class="mb-3">
-                            <label class="form-label">Selectează 5 jucători *</label>
-                            <small class="text-muted d-block mb-2">Trebuie să selectezi exact 5 jucători disponibili</small>
+    <main class="container my-5">
+        <?php foreach ($flashes as $flash): ?>
+            <div class="alert alert-<?= htmlspecialchars($flash['type']) ?> alert-dismissible fade show" role="alert">
+                <?= htmlspecialchars($flash['message']) ?>
+                <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+            </div>
+        <?php endforeach; ?>
+
+        <div class="row justify-content-center">
+            <div class="col-lg-8">
+                <div class="card">
+                    <div class="card-header">
+                        <h3 class="mb-0"><i class="bi bi-pencil-square"></i> Formular Înscriere Echipă</h3>
+                    </div>
+                    <div class="card-body">
+                        <?php if (isset($errors['general'])): ?>
+                            <div class="alert alert-danger"><?= htmlspecialchars($errors['general']) ?></div>
+                        <?php endif; ?>
+
+                        <form method="POST" action="">
+                            <input type="hidden" name="csrf_token" value="<?= csrf_token() ?>">
+
+                            <h5 class="mb-3">Date Echipă</h5>
                             
-                            <?php if (empty($availablePlayers)): ?>
-                                <div class="alert alert-warning">
-                                    Nu există jucători disponibili. Contactează administratorul.
+                            <div class="mb-3">
+                                <label for="nume_echipa" class="form-label">Nume Echipă *</label>
+                                <input type="text" class="form-control <?= isset($errors['nume_echipa']) ? 'is-invalid' : '' ?>" 
+                                       id="nume_echipa" name="nume_echipa" 
+                                       value="<?= htmlspecialchars($_POST['nume_echipa'] ?? '') ?>" required>
+                                <?php if (isset($errors['nume_echipa'])): ?>
+                                    <div class="invalid-feedback"><?= htmlspecialchars($errors['nume_echipa']) ?></div>
+                                <?php endif; ?>
+                            </div>
+
+                            <div class="row">
+                                <div class="col-md-6 mb-3">
+                                    <label for="capitan" class="form-label">Nume Capitan *</label>
+                                    <input type="text" class="form-control <?= isset($errors['capitan']) ? 'is-invalid' : '' ?>" 
+                                           id="capitan" name="capitan" 
+                                           value="<?= htmlspecialchars($_POST['capitan'] ?? '') ?>" required>
+                                    <?php if (isset($errors['capitan'])): ?>
+                                        <div class="invalid-feedback"><?= htmlspecialchars($errors['capitan']) ?></div>
+                                    <?php endif; ?>
                                 </div>
-                            <?php else: ?>
-                                <div class="row">
-                                    <?php foreach ($availablePlayers as $player): ?>
-                                        <div class="col-md-6 mb-2">
-                                            <div class="form-check">
-                                                <input class="form-check-input" type="checkbox" 
-                                                       name="jucatori[]" 
-                                                       value="<?= (int)$player['id_jucator'] ?>" 
-                                                       id="player_<?= (int)$player['id_jucator'] ?>"
-                                                       onchange="checkPlayerCount()">
-                                                <label class="form-check-label" for="player_<?= (int)$player['id_jucator'] ?>">
-                                                    <?= escape_html($player['nume'] . ' ' . $player['prenume']) ?>
-                                                </label>
-                                            </div>
+                                <div class="col-md-6 mb-3">
+                                    <label for="email" class="form-label">Email *</label>
+                                    <input type="email" class="form-control <?= isset($errors['email']) ? 'is-invalid' : '' ?>" 
+                                           id="email" name="email" 
+                                           value="<?= htmlspecialchars($_POST['email'] ?? '') ?>" required>
+                                    <?php if (isset($errors['email'])): ?>
+                                        <div class="invalid-feedback"><?= htmlspecialchars($errors['email']) ?></div>
+                                    <?php endif; ?>
+                                </div>
+                            </div>
+
+                            <div class="mb-3">
+                                <label for="telefon" class="form-label">Telefon *</label>
+                                <input type="tel" class="form-control <?= isset($errors['telefon']) ? 'is-invalid' : '' ?>" 
+                                       id="telefon" name="telefon" 
+                                       value="<?= htmlspecialchars($_POST['telefon'] ?? '') ?>" required>
+                                <?php if (isset($errors['telefon'])): ?>
+                                    <div class="invalid-feedback"><?= htmlspecialchars($errors['telefon']) ?></div>
+                                <?php endif; ?>
+                            </div>
+
+                            <hr class="my-4">
+
+                            <h5 class="mb-3">Jucători (minim 5)</h5>
+
+                            <?php for ($i = 1; $i <= 5; $i++): ?>
+                            <div class="card mb-3">
+                                <div class="card-body">
+                                    <h6 class="card-title">Jucător <?= $i ?></h6>
+                                    <div class="row">
+                                        <div class="col-md-4 mb-2">
+                                            <label class="form-label">Nume</label>
+                                            <input type="text" class="form-control" 
+                                                   name="jucator_nume_<?= $i ?>" 
+                                                   value="<?= htmlspecialchars($_POST["jucator_nume_$i"] ?? '') ?>">
                                         </div>
-                                    <?php endforeach; ?>
+                                        <div class="col-md-4 mb-2">
+                                            <label class="form-label">Prenume</label>
+                                            <input type="text" class="form-control" 
+                                                   name="jucator_prenume_<?= $i ?>" 
+                                                   value="<?= htmlspecialchars($_POST["jucator_prenume_$i"] ?? '') ?>">
+                                        </div>
+                                        <div class="col-md-4 mb-2">
+                                            <label class="form-label">Divizie</label>
+                                            <select class="form-select" name="jucator_divizie_<?= $i ?>">
+                                                <?php foreach ($divizii as $divizie): ?>
+                                                    <option value="<?= $divizie['id_divizie'] ?>" 
+                                                            <?= (($_POST["jucator_divizie_$i"] ?? 1) == $divizie['id_divizie']) ? 'selected' : '' ?>>
+                                                        <?= htmlspecialchars($divizie['nume_divizie']) ?>
+                                                    </option>
+                                                <?php endforeach; ?>
+                                            </select>
+                                        </div>
+                                    </div>
                                 </div>
-                                <small id="playerCount" class="text-muted">0 jucători selectați</small>
-                            <?php endif; ?>
-                        </div>
-                        
-                        <div class="mb-3">
-                            <div class="g-recaptcha" data-sitekey="<?= RECAPTCHA_SITE_KEY ?>"></div>
-                        </div>
-                        
-                        <button type="submit" class="btn btn-primary" id="submitBtn" disabled>
-                            Înregistrează echipa
-                        </button>
-                    </form>
+                            </div>
+                            <?php endfor; ?>
+
+                            <div class="d-grid gap-2">
+                                <button type="submit" class="btn btn-primary btn-lg">
+                                    <i class="bi bi-check-circle"></i> Trimite Înscrierea
+                                </button>
+                            </div>
+                        </form>
+                    </div>
                 </div>
             </div>
         </div>
-    </div>
-</div>
+    </main>
 
-<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
-<script>
-function checkPlayerCount() {
-    const checkboxes = document.querySelectorAll('input[name="jucatori[]"]:checked');
-    const count = checkboxes.length;
-    document.getElementById('playerCount').textContent = count + ' jucători selectați';
-    document.getElementById('submitBtn').disabled = count !== 5;
-}
-</script>
+    <?php include 'includes/footer.php'; ?>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
 </body>
 </html>
 
